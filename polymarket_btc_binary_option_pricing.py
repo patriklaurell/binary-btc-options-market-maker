@@ -47,11 +47,7 @@ class EWMAVolatilityEstimator:
 
 
 class BitcoinPriceOracle:
-    def __init__(self, api_url="https://api.binance.com/api/v3/ticker/24hr", initial_strike=None):
-        self.api_url = api_url
-        self.params = {
-            'symbol': 'BTCUSDT'
-        }
+    def __init__(self, initial_strike=None):
         # Use EWMA with high lambda (0.98) for second-by-second updates
         self.volatility_estimator = EWMAVolatilityEstimator(lambda_ewma=0.98, initial_vol=0.0001)
         self.last_price = None
@@ -59,26 +55,132 @@ class BitcoinPriceOracle:
         self.strike_price = initial_strike  # Strike price for current quarter
         self.current_quarter = None  # Track current quarter hour period
 
-    def fetch_price(self):
-        """Fetch current Bitcoin price from Binance API"""
+    def fetch_binance_price(self):
+        """Fetch Bitcoin price from Binance"""
         try:
-            response = requests.get(self.api_url, params=self.params, timeout=5)
+            url = "https://api.binance.com/api/v3/ticker/24hr"
+            params = {'symbol': 'BTCUSDT'}
+            response = requests.get(url, params=params, timeout=5)
             response.raise_for_status()
             data = response.json()
+            return float(data['lastPrice'])
+        except (requests.exceptions.RequestException, KeyError, ValueError) as e:
+            print(f"Binance error: {e}")
+            return None
 
-            price = float(data['lastPrice'])
-            change_24h = float(data['priceChangePercent'])
+    def fetch_kraken_price(self):
+        """Fetch Bitcoin price from Kraken"""
+        try:
+            url = "https://api.kraken.com/0/public/Ticker"
+            params = {'pair': 'XBTUSD'}
+            response = requests.get(url, params=params, timeout=5)
+            response.raise_for_status()
+            data = response.json()
+            # Kraken returns last trade price in result['XXBTZUSD']['c'][0]
+            price = float(data['result']['XXBTZUSD']['c'][0])
+            return price
+        except (requests.exceptions.RequestException, KeyError, ValueError) as e:
+            print(f"Kraken error: {e}")
+            return None
+
+    def fetch_coinbase_price(self):
+        """Fetch Bitcoin price from Coinbase"""
+        try:
+            url = "https://api.exchange.coinbase.com/products/BTC-USD/ticker"
+            response = requests.get(url, timeout=5)
+            response.raise_for_status()
+            data = response.json()
+            # Coinbase returns last trade price in 'price' field
+            price = float(data['price'])
+            return price
+        except (requests.exceptions.RequestException, KeyError, ValueError) as e:
+            print(f"Coinbase error: {e}")
+            return None
+
+    def fetch_bitstamp_price(self):
+        """Fetch Bitcoin price from Bitstamp"""
+        try:
+            url = "https://www.bitstamp.net/api/v2/ticker/btcusd"
+            response = requests.get(url, timeout=5)
+            response.raise_for_status()
+            data = response.json()
+            # Bitstamp returns last trade price in 'last' field
+            price = float(data['last'])
+            return price
+        except (requests.exceptions.RequestException, KeyError, ValueError) as e:
+            print(f"Bitstamp error: {e}")
+            return None
+
+    def fetch_okx_price(self):
+        """Fetch Bitcoin price from OKX"""
+        try:
+            url = "https://www.okx.com/api/v5/market/ticker"
+            params = {'instId': 'BTC-USDT'}
+            response = requests.get(url, params=params, timeout=5)
+            response.raise_for_status()
+            data = response.json()
+            # OKX returns last price in data[0]['last']
+            price = float(data['data'][0]['last'])
+            return price
+        except (requests.exceptions.RequestException, KeyError, ValueError, IndexError) as e:
+            print(f"OKX error: {e}")
+            return None
+
+    def fetch_price(self):
+        """
+        Fetch Bitcoin prices from Binance, Kraken, Coinbase, Bitstamp, and OKX
+        Returns average price across all available venues
+        """
+        # Fetch from all five exchanges
+        binance_price = self.fetch_binance_price()
+        kraken_price = self.fetch_kraken_price()
+        coinbase_price = self.fetch_coinbase_price()
+        bitstamp_price = self.fetch_bitstamp_price()
+        okx_price = self.fetch_okx_price()
+
+        # Collect valid prices
+        prices = []
+        venue_info = []
+
+        if binance_price:
+            prices.append(binance_price)
+            venue_info.append(f"Binance: ${binance_price:,.2f}")
+        if kraken_price:
+            prices.append(kraken_price)
+            venue_info.append(f"Kraken: ${kraken_price:,.2f}")
+        if coinbase_price:
+            prices.append(coinbase_price)
+            venue_info.append(f"Coinbase: ${coinbase_price:,.2f}")
+        if bitstamp_price:
+            prices.append(bitstamp_price)
+            venue_info.append(f"Bitstamp: ${bitstamp_price:,.2f}")
+        if okx_price:
+            prices.append(okx_price)
+            venue_info.append(f"OKX: ${okx_price:,.2f}")
+
+        # If we have at least one price, calculate average
+        if prices:
+            avg_price = sum(prices) / len(prices)
+
+            # Calculate spread (max - min)
+            spread = max(prices) - min(prices) if len(prices) > 1 else 0
 
             return {
-                'price': price,
-                'change_24h': change_24h,
-                'timestamp': datetime.now()
+                'price': avg_price,
+                'timestamp': datetime.now(),
+                'venues': len(prices),
+                'venue_prices': {
+                    'binance': binance_price,
+                    'kraken': kraken_price,
+                    'coinbase': coinbase_price,
+                    'bitstamp': bitstamp_price,
+                    'okx': okx_price
+                },
+                'spread': spread,
+                'venue_info': venue_info
             }
-        except requests.exceptions.RequestException as e:
-            print(f"Error fetching price: {e}")
-            return None
-        except (KeyError, ValueError) as e:
-            print(f"Error parsing response: {e}")
+        else:
+            print("Error: Unable to fetch price from any exchange")
             return None
 
     def update_volatility(self, current_price):
@@ -143,6 +245,68 @@ class BitcoinPriceOracle:
         prob = norm.cdf(d2)
 
         return prob
+
+
+    def fetch_polymarket_orderbook(self, token_id):
+        """
+        Fetch orderbook for a Polymarket market
+
+        Args:
+            token_id: Token ID of the market (e.g., "21742633143463906290569050155826241533067272736897614950488156847949938836455")
+
+        Returns:
+            Dictionary containing orderbook data:
+            {
+                'market': Market condition ID,
+                'asset_id': Asset/token ID,
+                'timestamp': Unix timestamp in milliseconds,
+                'bids': List of [price, size] pairs,
+                'asks': List of [price, size] pairs,
+                'best_bid': Best bid price,
+                'best_ask': Best ask price,
+                'spread': Bid-ask spread,
+                'mid_price': Mid-market price
+            }
+            Returns None on error
+        """
+        try:
+            url = "https://clob.polymarket.com/book"
+            params = {'token_id': token_id}
+
+            response = requests.get(url, params=params, timeout=5)
+            response.raise_for_status()
+            data = response.json()
+
+            # Parse bids and asks
+            bids = [[float(bid['price']), float(bid['size'])] for bid in data.get('bids', [])]
+            asks = [[float(ask['price']), float(ask['size'])] for ask in data.get('asks', [])]
+
+            # Calculate best prices and spread
+            best_bid = bids[0][0] if bids else None
+            best_ask = asks[0][0] if asks else None
+            spread = (best_ask - best_bid) if (best_bid and best_ask) else None
+            mid_price = ((best_bid + best_ask) / 2) if (best_bid and best_ask) else None
+
+            return {
+                'market': data.get('market'),
+                'asset_id': data.get('asset_id'),
+                'timestamp': data.get('timestamp'),
+                'bids': bids,
+                'asks': asks,
+                'best_bid': best_bid,
+                'best_ask': best_ask,
+                'spread': spread,
+                'mid_price': mid_price,
+                'min_order_size': data.get('min_order_size'),
+                'tick_size': data.get('tick_size')
+            }
+
+        except requests.exceptions.RequestException as e:
+            print(f"Error fetching Polymarket orderbook: {e}")
+            return None
+        except (KeyError, ValueError, IndexError) as e:
+            print(f"Error parsing Polymarket orderbook: {e}")
+            return None
 
     def get_current_quarter(self, current_time):
         """
@@ -231,7 +395,8 @@ class BitcoinPriceOracle:
         """
         print("Polymarket BTC Binary Option Pricing")
         print("Real-time volatility estimation using EWMA")
-        print(f"Fetching price every {interval} second(s)")
+        print("Fetching prices from Binance, Kraken, Coinbase, Bitstamp, and OKX")
+        print(f"Polling interval: {interval} second(s)")
         print("=" * 80)
 
         try:
@@ -241,7 +406,9 @@ class BitcoinPriceOracle:
                 if price_data:
                     timestamp = price_data['timestamp'].strftime('%Y-%m-%d %H:%M:%S')
                     price = price_data['price']
-                    change = price_data['change_24h']
+                    venues = price_data['venues']
+                    spread = price_data['spread']
+                    venue_info = price_data['venue_info']
 
                     # Update strike price if new quarter hour started
                     strike_updated = self.update_strike_price(price_data['timestamp'], price)
@@ -249,9 +416,11 @@ class BitcoinPriceOracle:
                     # Update volatility estimate
                     vol = self.update_volatility(price)
 
-                    change_symbol = "+" if change >= 0 else ""
                     print(f"\n[{timestamp}]")
-                    print(f"  Price: ${price:,.2f} ({change_symbol}{change:.2f}% 24h)")
+                    print(f"  Average Price: ${price:,.2f} (from {venues} venue{'s' if venues > 1 else ''})")
+                    print(f"  Venues: {', '.join(venue_info)}")
+                    if venues > 1:
+                        print(f"  Cross-Exchange Spread: ${spread:.2f}")
                     print(f"  Volatility (EWMA): {vol*100:.2f}% annualized")
 
                     if self.strike_price is not None:
@@ -261,7 +430,7 @@ class BitcoinPriceOracle:
 
                     # Show binary option prices
                     if show_options and self.last_price is not None and self.strike_price is not None:
-                        print(f"\n  Binary Option Prices (pays $1 if BTC > ${self.strike_price:,.2f} at expiry):")
+                        print(f"\n  Binary Option Prices (pays $1 if BTC > ${self.strike_price:,.2f} at expiry):\n")
 
                         # Get next 3 quarter hour expiries
                         quarters = self.get_next_quarter_hours(price_data['timestamp'], num_quarters=3)
@@ -273,21 +442,29 @@ class BitcoinPriceOracle:
                         for quarter_time, seconds_until in quarters:
                             time_label = quarter_time.strftime("%H:%M")
                             mins_until = int(seconds_until / 60)
-                            header += f" {time_label}({mins_until}m)  "
-                            separator += f" {'-'*12}"
+                            header += f"\t{time_label}({mins_until}m)  "
+                            separator += f"\t{'-'*12}"
 
                         print(header)
                         print(separator)
 
                         # Calculate probability for each expiry
-                        row = f"  {'Fair Price':<15}"
+                        row = f"  {'Fair Price (Long)':<15}"
                         for quarter_time, seconds_until in quarters:
                             prob = self.calculate_binary_option_price(self.strike_price, seconds_until, price)
                             if prob is not None:
-                                row += f" ${prob:.4f}     "
+                                row += f"\t${prob:.4f}     "
                             else:
                                 row += f" N/A         "
+                        print(row)
 
+                        row = f"  {'Fair Price (Short)':<15}"
+                        for quarter_time, seconds_until in quarters:
+                            prob = self.calculate_binary_option_price(self.strike_price, seconds_until, price)
+                            if prob is not None:
+                                row += f"\t${1-prob:.4f}     "
+                            else:
+                                row += f" N/A         "
                         print(row)
 
                     print("-" * 80)
