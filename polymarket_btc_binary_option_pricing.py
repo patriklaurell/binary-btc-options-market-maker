@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 import numpy as np
 from scipy.stats import norm
 import argparse
+from typing import Dict, Tuple, Optional
 
 
 class EWMAVolatilityEstimator:
@@ -46,14 +47,246 @@ class EWMAVolatilityEstimator:
         return np.sqrt(self.variance)
 
 
+class AvellanedaStoikovMarketMaker:
+    """
+    Avellaneda-Stoikov market making strategy adapted for binary options.
+
+    The strategy optimally sets bid and ask spreads based on:
+    - Inventory risk (position deviation from target)
+    - Market volatility
+    - Time to expiry
+    - Risk aversion parameter
+
+    Key formulas:
+    - Reservation price: r = s - q * gamma * sigma^2 * (T - t)
+    - Optimal spread: delta = gamma * sigma^2 * (T - t) + (2/gamma) * ln(1 + gamma/k)
+    - Bid/Ask quotes: bid = r - delta/2, ask = r + delta/2
+
+    Where:
+    - s = fair value (mid price)
+    - q = inventory position (normalized, -1 to 1)
+    - gamma = risk aversion parameter
+    - sigma = volatility
+    - T - t = time to expiry
+    - k = order arrival rate parameter
+    """
+
+    def __init__(
+        self,
+        risk_aversion: float = 0.1,
+        order_arrival_rate: float = 1.0,
+        target_inventory: float = 0.0,
+        max_inventory: float = 100.0,
+        min_spread: float = 0.001,
+        max_spread: float = 0.1
+    ):
+        """
+        Initialize Avellaneda-Stoikov market maker.
+
+        Args:
+            risk_aversion: Risk aversion parameter gamma (higher = wider spreads)
+            order_arrival_rate: Expected order arrival rate k (higher = tighter spreads)
+            target_inventory: Target inventory level (usually 0 for market neutral)
+            max_inventory: Maximum inventory size for normalization
+            min_spread: Minimum allowed spread
+            max_spread: Maximum allowed spread
+        """
+        self.gamma = risk_aversion
+        self.k = order_arrival_rate
+        self.target_inventory = target_inventory
+        self.max_inventory = max_inventory
+        self.min_spread = min_spread
+        self.max_spread = max_spread
+
+        # Track inventory
+        self.inventory = 0.0  # Current position in contracts
+
+    def calculate_reservation_price(
+        self,
+        fair_value: float,
+        inventory: float,
+        volatility: float,
+        time_to_expiry: float
+    ) -> float:
+        """
+        Calculate reservation price (indifference price) based on inventory.
+
+        The reservation price is the price at which the market maker is indifferent
+        between buying and selling, adjusted for inventory risk.
+
+        Args:
+            fair_value: Fair value of the binary option
+            inventory: Current inventory position (number of contracts)
+            volatility: Market volatility (annualized)
+            time_to_expiry: Time to expiry in years
+
+        Returns:
+            Reservation price
+        """
+        # Normalize inventory to [-1, 1] range
+        q = (inventory - self.target_inventory) / self.max_inventory
+        q = np.clip(q, -1, 1)
+
+        # Inventory adjustment term
+        # For binary options, we use the fair value variance as risk measure
+        # Variance of binary option ≈ p(1-p) where p is fair value
+        option_variance = fair_value * (1 - fair_value)
+
+        # Adjust reservation price based on inventory
+        # If long (q > 0), lower reservation price to encourage selling
+        # If short (q < 0), raise reservation price to encourage buying
+        inventory_adjustment = q * self.gamma * option_variance * time_to_expiry
+
+        reservation_price = fair_value - inventory_adjustment
+
+        # Ensure reservation price stays in valid probability range [0, 1]
+        return np.clip(reservation_price, 0.001, 0.999)
+
+    def calculate_optimal_spread(
+        self,
+        fair_value: float,
+        volatility: float,
+        time_to_expiry: float
+    ) -> float:
+        """
+        Calculate optimal bid-ask spread using Avellaneda-Stoikov formula.
+
+        Args:
+            fair_value: Fair value of the binary option
+            volatility: Market volatility (annualized)
+            time_to_expiry: Time to expiry in years
+
+        Returns:
+            Optimal half-spread
+        """
+        # For binary options, use fair value variance as risk measure
+        option_variance = fair_value * (1 - fair_value)
+
+        # Avellaneda-Stoikov optimal spread formula
+        # delta = gamma * sigma^2 * (T - t) + (2/gamma) * ln(1 + gamma/k)
+        risk_term = self.gamma * option_variance * time_to_expiry
+        arrival_term = (2 / self.gamma) * np.log(1 + self.gamma / self.k)
+
+        half_spread = risk_term + arrival_term
+
+        # Apply spread limits
+        half_spread = np.clip(half_spread, self.min_spread / 2, self.max_spread / 2)
+
+        return half_spread
+
+    def calculate_quotes(
+        self,
+        fair_value: float,
+        inventory: float,
+        volatility: float,
+        time_to_expiry: float
+    ) -> Dict[str, float]:
+        """
+        Calculate optimal bid and ask quotes.
+
+        Args:
+            fair_value: Fair value of the binary option
+            inventory: Current inventory position
+            volatility: Market volatility (annualized)
+            time_to_expiry: Time to expiry in years
+
+        Returns:
+            Dictionary with bid, ask, mid, spread, and reservation_price
+        """
+        # Calculate reservation price
+        reservation_price = self.calculate_reservation_price(
+            fair_value, inventory, volatility, time_to_expiry
+        )
+
+        # Calculate optimal spread
+        half_spread = self.calculate_optimal_spread(
+            fair_value, volatility, time_to_expiry
+        )
+
+        # Set bid and ask around reservation price
+        bid = reservation_price - half_spread
+        ask = reservation_price + half_spread
+
+        # Ensure valid probability ranges
+        bid = np.clip(bid, 0.001, 0.999)
+        ask = np.clip(ask, 0.001, 0.999)
+
+        # Ensure bid < ask
+        if bid >= ask:
+            mid = (bid + ask) / 2
+            bid = mid - 0.001
+            ask = mid + 0.001
+
+        return {
+            'bid': bid,
+            'ask': ask,
+            'mid': (bid + ask) / 2,
+            'spread': ask - bid,
+            'reservation_price': reservation_price,
+            'half_spread': half_spread,
+            'fair_value': fair_value
+        }
+
+    def update_inventory(self, trade_size: float, is_buy: bool):
+        """
+        Update inventory after a trade.
+
+        Args:
+            trade_size: Size of the trade in contracts
+            is_buy: True if buying, False if selling
+        """
+        if is_buy:
+            self.inventory += trade_size
+        else:
+            self.inventory -= trade_size
+
+    def get_inventory_metrics(self) -> Dict[str, float]:
+        """
+        Get current inventory metrics.
+
+        Returns:
+            Dictionary with inventory statistics
+        """
+        normalized_inventory = (self.inventory - self.target_inventory) / self.max_inventory
+        normalized_inventory = np.clip(normalized_inventory, -1, 1)
+
+        return {
+            'inventory': self.inventory,
+            'target_inventory': self.target_inventory,
+            'normalized_inventory': normalized_inventory,
+            'inventory_pct': normalized_inventory * 100,
+            'distance_from_target': abs(self.inventory - self.target_inventory)
+        }
+
+
 class BitcoinPriceOracle:
-    def __init__(self, initial_strike=None):
+    def __init__(
+        self,
+        initial_strike=None,
+        enable_market_maker=False,
+        risk_aversion=0.1,
+        order_arrival_rate=1.0,
+        max_inventory=100.0
+    ):
         # Use EWMA with high lambda (0.98) for second-by-second updates
         self.volatility_estimator = EWMAVolatilityEstimator(lambda_ewma=0.98, initial_vol=0.0001)
         self.last_price = None
         self.volatility = 0.50  # Initial volatility estimate (50% annualized)
         self.strike_price = initial_strike  # Strike price for current quarter
         self.current_quarter = None  # Track current quarter hour period
+
+        # Market maker
+        self.enable_market_maker = enable_market_maker
+        self.market_maker = None
+        if enable_market_maker:
+            self.market_maker = AvellanedaStoikovMarketMaker(
+                risk_aversion=risk_aversion,
+                order_arrival_rate=order_arrival_rate,
+                target_inventory=0.0,
+                max_inventory=max_inventory,
+                min_spread=0.001,
+                max_spread=0.1
+            )
 
     def fetch_binance_price(self):
         """Fetch Bitcoin price from Binance"""
@@ -467,6 +700,48 @@ class BitcoinPriceOracle:
                                 row += f" N/A         "
                         print(row)
 
+                        # Display Avellaneda-Stoikov market maker quotes if enabled
+                        if self.enable_market_maker and self.market_maker is not None:
+                            print(f"\n  Avellaneda-Stoikov Market Maker Quotes:\n")
+
+                            # Get inventory metrics
+                            inv_metrics = self.market_maker.get_inventory_metrics()
+                            print(f"  Inventory: {inv_metrics['inventory']:.2f} contracts "
+                                  f"({inv_metrics['inventory_pct']:.1f}% of max, "
+                                  f"target: {inv_metrics['target_inventory']:.2f})")
+
+                            # Calculate and display quotes for each expiry
+                            print(f"\n  {'Expiry Time':<15}\t{'Fair Value':<12}\t{'Bid':<10}\t{'Ask':<10}\t{'Spread':<10}\t{'Res.Price':<10}")
+                            print(f"  {'-'*15}\t{'-'*12}\t{'-'*10}\t{'-'*10}\t{'-'*10}\t{'-'*10}")
+
+                            for quarter_time, seconds_until in quarters:
+                                # Calculate fair value
+                                fair_value = self.calculate_binary_option_price(
+                                    self.strike_price, seconds_until, price
+                                )
+
+                                if fair_value is not None:
+                                    # Calculate time to expiry in years
+                                    time_to_expiry_years = seconds_until / (365.25 * 24 * 3600)
+
+                                    # Get market maker quotes
+                                    quotes = self.market_maker.calculate_quotes(
+                                        fair_value=fair_value,
+                                        inventory=self.market_maker.inventory,
+                                        volatility=vol,
+                                        time_to_expiry=time_to_expiry_years
+                                    )
+
+                                    time_label = quarter_time.strftime("%H:%M")
+                                    mins_until = int(seconds_until / 60)
+
+                                    print(f"  {time_label}({mins_until}m)     "
+                                          f"\t${fair_value:.4f}    "
+                                          f"\t${quotes['bid']:.4f}  "
+                                          f"\t${quotes['ask']:.4f}  "
+                                          f"\t${quotes['spread']:.4f}  "
+                                          f"\t${quotes['reservation_price']:.4f}")
+
                     print("-" * 80)
 
                 time.sleep(interval)
@@ -491,8 +766,37 @@ if __name__ == "__main__":
         help='Seconds between price fetches (default: 1)',
         default=1
     )
+    parser.add_argument(
+        '--market-maker',
+        action='store_true',
+        help='Enable Avellaneda-Stoikov market making strategy'
+    )
+    parser.add_argument(
+        '--risk-aversion',
+        type=float,
+        help='Risk aversion parameter gamma for market maker (higher = wider spreads, default: 0.1)',
+        default=0.1
+    )
+    parser.add_argument(
+        '--order-arrival-rate',
+        type=float,
+        help='Expected order arrival rate k for market maker (higher = tighter spreads, default: 1.0)',
+        default=1.0
+    )
+    parser.add_argument(
+        '--max-inventory',
+        type=float,
+        help='Maximum inventory size in contracts (default: 100.0)',
+        default=100.0
+    )
 
     args = parser.parse_args()
 
-    oracle = BitcoinPriceOracle(initial_strike=args.strike)
+    oracle = BitcoinPriceOracle(
+        initial_strike=args.strike,
+        enable_market_maker=args.market_maker,
+        risk_aversion=args.risk_aversion,
+        order_arrival_rate=args.order_arrival_rate,
+        max_inventory=args.max_inventory
+    )
     oracle.run(interval=args.interval)
